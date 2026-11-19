@@ -220,7 +220,7 @@ export async function completeBurn(
   digest: string,
   relayerSecret: string,
   sourceDomain: number = SUI_DOMAIN,
-  opts: { minAmount?: bigint } = {},
+  opts: { minAmount?: bigint; confirmTimeoutMs?: number; confirmPollMs?: number } = {},
 ): Promise<CompleteResult> {
   const key = `${sourceDomain}:${digest}`;
   if (inFlight.has(key)) return { status: "pending", reason: "already being completed" };
@@ -288,7 +288,16 @@ export async function completeBurn(
     if (sent.status === "ERROR") throw new Error("the network rejected the transaction");
 
     // stellar-sdk 13 cannot decode protocol 23+ result meta, so confirm through Horizon's JSON.
-    const confirmed = await confirmViaHorizon(sent.hash);
+    // Once sendTransaction succeeded, always return `{ status: "submitted", hash }` even if
+    // confirmation cannot be read.
+    const confirmed = await confirmViaHorizon(
+      sent.hash,
+      opts.confirmTimeoutMs,
+      opts.confirmPollMs,
+    ).catch((err) => {
+      console.error("[stellar-side] Horizon confirmation failed", err);
+      return null;
+    });
     if (!confirmed) return { status: "submitted", hash: sent.hash };
     if (confirmed.successful) {
       return { status: "submitted", hash: sent.hash, ledger: confirmed.ledger };
@@ -302,18 +311,33 @@ export async function completeBurn(
   }
 }
 
-async function confirmViaHorizon(
+const HORIZON_POLL_TIMEOUT_MS = 5_000;
+
+export async function confirmViaHorizon(
   hash: string,
   timeoutMs = 45_000,
+  pollMs = 2_500,
 ): Promise<{ successful: boolean; ledger: number } | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const r = await fetch(`${env.horizonUrl}/transactions/${hash}`, { cache: "no-store" });
-    if (r.ok) {
-      const t = (await r.json()) as { successful: boolean; ledger: number };
-      return { successful: t.successful, ledger: t.ledger };
+    try {
+      const r = await fetch(`${env.horizonUrl}/transactions/${hash}`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(HORIZON_POLL_TIMEOUT_MS),
+      });
+      if (r.ok) {
+        const t = (await r.json()) as { successful: boolean; ledger: number };
+        return { successful: t.successful, ledger: t.ledger };
+      }
+      if (r.status === 429 || r.status >= 500) {
+        console.error(`[stellar-side] Horizon confirmation returned ${r.status} for ${hash}`);
+      }
+    } catch (err) {
+      console.error(`[stellar-side] Horizon confirmation error for ${hash}`, err);
     }
-    await new Promise((res) => setTimeout(res, 2500));
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((res) => setTimeout(res, Math.min(pollMs, remaining)));
   }
   return null;
 }
