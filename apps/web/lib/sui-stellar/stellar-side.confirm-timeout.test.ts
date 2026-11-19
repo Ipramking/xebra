@@ -1,4 +1,4 @@
-import { Keypair, nativeToScVal, rpc } from "@stellar/stellar-sdk";
+import { Keypair, nativeToScVal, type rpc } from "@stellar/stellar-sdk";
 import { verifyMessage } from "@xebra/sdk/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readAttestation } from "./attestation";
