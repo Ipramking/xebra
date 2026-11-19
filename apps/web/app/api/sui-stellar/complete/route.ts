@@ -1,4 +1,5 @@
 import { SUI_DIGEST } from "../../../../lib/sui-stellar/attestation";
+import { completeResultResponse } from "../../../../lib/sui-stellar/complete-response";
 import { notFound, relayerSecret, suiStellarEnabled } from "../../../../lib/sui-stellar/config";
 import { completeBurn } from "../../../../lib/sui-stellar/stellar-side";
 
@@ -36,8 +37,7 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const result = await completeBurn(digest, secret);
-    const code = result.status === "refused" ? 422 : result.status === "failed" ? 502 : 200;
-    return Response.json(result, { status: code });
+    return completeResultResponse(result);
   } catch (err) {
     console.error("sui-stellar complete failed", err);
     return Response.json(

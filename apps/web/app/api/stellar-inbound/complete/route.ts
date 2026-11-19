@@ -1,6 +1,7 @@
 import { EVM_CHAINS, SUI_DOMAIN } from "@xebra/sdk/core";
 import { SOLANA_CCTP_DOMAIN, SOLANA_SIGNATURE } from "../../../../lib/solana-source/config";
 import { SUI_DIGEST } from "../../../../lib/sui-stellar/attestation";
+import { completeResultResponse } from "../../../../lib/sui-stellar/complete-response";
 import { relayerSecret } from "../../../../lib/sui-stellar/config";
 
 /** Aptos's CCTP domain; its transaction hashes are 0x and 64 hex, like an EVM chain's. */
@@ -81,8 +82,7 @@ export async function POST(request: Request): Promise<Response> {
     const result = await completeBurn(sui || solana ? tx : tx.toLowerCase(), secret, src, {
       ...(sui ? {} : { minAmount: MIN_RELAYED_UNITS }),
     });
-    const code = result.status === "refused" ? 422 : result.status === "failed" ? 502 : 200;
-    return Response.json(result, { status: code });
+    return completeResultResponse(result);
   } catch (err) {
     console.error("stellar-inbound complete failed", err);
     return Response.json(

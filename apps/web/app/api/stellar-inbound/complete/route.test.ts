@@ -68,6 +68,17 @@ describe("POST /api/stellar-inbound/complete", () => {
     expect((await post({ src: 26, tx: EVM_TX })).status).toBe(422);
   });
 
+  it("answers 503 with Retry-After when the network asks to try again later", async () => {
+    completeBurn.mockResolvedValue({
+      status: "pending",
+      retryAfterMs: 5_000,
+      reason: "Stellar is busy and declined to queue the mint right now. Try again shortly.",
+    });
+    const res = await post({ src: 26, tx: EVM_TX });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("5");
+  });
+
   it("completes an Aptos burn, with the 1 USDC floor, only while Aptos may send to Stellar", async () => {
     const APTOS_TX = `0x${"cd".repeat(32)}`;
     const refused = await post({ src: 9, tx: APTOS_TX });

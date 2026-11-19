@@ -17,6 +17,7 @@ import {
   verifyMessage,
 } from "@xebra/sdk/core";
 import { APTOS_CCTP_DOMAIN, aptosDestinations } from "../aptos/config";
+import { describeRejectedTransaction } from "../cctp-bridge";
 import { env } from "../env";
 import { readAttestation } from "./attestation";
 
@@ -124,10 +125,14 @@ function verify(message: string): VerifiedBurn {
 }
 
 export type CompleteResult =
-  | { status: "pending" | "unknown"; reason?: string }
+  | { status: "pending"; reason?: string; retryAfterMs?: number }
+  | { status: "unknown"; reason?: string }
   | { status: "delivered" }
   | { status: "refused"; reason: string }
-  | { status: "submitted" | "failed"; hash: string; ledger?: number };
+  | { status: "submitted"; hash: string; ledger?: number }
+  | { status: "failed"; hash?: string; reason?: string; ledger?: number };
+
+const RETRY_AFTER_MS = 5_000;
 
 // A Vercel instance serves many requests; this stops the same instance from sending one digest twice
 // at once. Two instances racing is possible and costs one failed (reverted) fee, never funds; the
@@ -346,27 +351,44 @@ export async function completeBurn(
     const prepared = prep.prepared;
     prepared.sign(keypair);
     const sent = await server.sendTransaction(prepared);
-    if (sent.status === "ERROR") throw new Error("the network rejected the transaction");
-
-    // stellar-sdk 13 cannot decode protocol 23+ result meta, so confirm through Horizon's JSON.
-    // Once sendTransaction succeeded, always return `{ status: "submitted", hash }` even if
-    // confirmation cannot be read.
-    const confirmed = await confirmViaHorizon(
-      sent.hash,
-      opts.confirmTimeoutMs,
-      opts.confirmPollMs,
-    ).catch((err) => {
-      console.error("[stellar-side] Horizon confirmation failed", err);
-      return null;
-    });
-    if (!confirmed) return { status: "submitted", hash: sent.hash };
-    if (confirmed.successful) {
-      return { status: "submitted", hash: sent.hash, ledger: confirmed.ledger };
+    switch (sent.status) {
+      case "PENDING":
+      case "DUPLICATE": {
+        // stellar-sdk 13 cannot decode protocol 23+ result meta, so confirm through Horizon's JSON.
+        // Once sendTransaction succeeded, always return `{ status: "submitted", hash }` even if
+        // confirmation cannot be read.
+        const confirmed = await confirmViaHorizon(
+          sent.hash,
+          opts.confirmTimeoutMs,
+          opts.confirmPollMs,
+        ).catch((err) => {
+          console.error("[stellar-side] Horizon confirmation failed", err);
+          return null;
+        });
+        if (!confirmed) return { status: "submitted", hash: sent.hash };
+        if (confirmed.successful) {
+          return { status: "submitted", hash: sent.hash, ledger: confirmed.ledger };
+        }
+        // Failed on chain. If another instance completed the same message first, the nonce is now used
+        // and the USDC has arrived: tell the caller it was delivered, not that it failed.
+        if ((await mintState(att, keypair.publicKey())) === "delivered") {
+          return { status: "delivered" };
+        }
+        return { status: "failed", hash: sent.hash, ledger: confirmed.ledger };
+      }
+      case "TRY_AGAIN_LATER":
+        return {
+          status: "pending",
+          retryAfterMs: RETRY_AFTER_MS,
+          reason: "Stellar is busy and declined to queue the mint right now. Try again shortly.",
+        };
+      case "ERROR":
+      default:
+        return {
+          status: "failed",
+          reason: describeRejectedTransaction(sent, "mint", keypair.publicKey()),
+        };
     }
-    // Failed on chain. If another instance completed the same message first, the nonce is now used
-    // and the USDC has arrived: tell the caller it was delivered, not that it failed.
-    if ((await mintState(att, keypair.publicKey())) === "delivered") return { status: "delivered" };
-    return { status: "failed", hash: sent.hash, ledger: confirmed.ledger };
   } finally {
     inFlight.delete(key);
   }
