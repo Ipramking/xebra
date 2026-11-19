@@ -3,6 +3,7 @@ import {
   BASE_FEE,
   Contract,
   Keypair,
+  type Transaction,
   TransactionBuilder,
   nativeToScVal,
   rpc,
@@ -156,6 +157,44 @@ export async function mintState(
   }
 }
 
+/** Extracts a contract error code (`Error(Contract, #N)`) when Soroban names one; never raw trace text. */
+function contractErrorCode(raw: string): string | null {
+  const match = raw.match(/Error\(Contract,\s*#(\d+)\)/);
+  return match ? `contract error #${match[1]}` : null;
+}
+
+type PrepareMintOutcome =
+  | { ok: true; prepared: Transaction }
+  | { ok: false; delivered: true }
+  | { ok: false; delivered: false; reason: string };
+
+/**
+ * Simulates a mint transaction and distinguishes real Soroban contract refusals (`isSimulationError`)
+ * from RPC transport outages (which are rethrown so routes return 502/503 `upstream_unavailable`).
+ */
+async function prepareMintTransaction(
+  server: rpc.Server,
+  tx: Transaction,
+  context: string,
+): Promise<PrepareMintOutcome> {
+  const sim = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim)) {
+    if (sim.error.includes(NONCE_ALREADY_USED)) {
+      return { ok: false, delivered: true };
+    }
+    console.error(`[stellar-side] ${context} simulation refused`, sim.error);
+    const decoded = contractErrorCode(sim.error);
+    return {
+      ok: false,
+      delivered: false,
+      reason: decoded
+        ? `Stellar would not accept this mint (${decoded}).`
+        : "Stellar would not accept this mint.",
+    };
+  }
+  return { ok: true, prepared: rpc.assembleTransaction(tx, sim).build() };
+}
+
 export type ClaimPlan =
   | { ok: true; xdr: string; recipient: string; amount: bigint }
   | { ok: false; reason: string; delivered?: boolean };
@@ -204,16 +243,18 @@ export async function planClaim(
     .addOperation(mintCall(att))
     .setTimeout(300)
     .build();
-  try {
-    const prepared = await server.prepareTransaction(tx);
-    return { ok: true, xdr: prepared.toXDR(), recipient: burn.recipient, amount: burn.amount };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes(NONCE_ALREADY_USED)) {
-      return { ok: false, reason: "This transfer was already completed.", delivered: true };
-    }
-    return { ok: false, reason: `Stellar would not accept this mint (${msg.slice(0, 200)}).` };
+  const prep = await prepareMintTransaction(server, tx, "planClaim");
+  if (!prep.ok) {
+    return prep.delivered
+      ? { ok: false, reason: "This transfer was already completed.", delivered: true }
+      : { ok: false, reason: prep.reason };
   }
+  return {
+    ok: true,
+    xdr: prep.prepared.toXDR(),
+    recipient: burn.recipient,
+    amount: burn.amount,
+  };
 }
 
 export async function completeBurn(
@@ -270,19 +311,15 @@ export async function completeBurn(
       .setTimeout(180)
       .build();
 
-    let prepared: Awaited<ReturnType<rpc.Server["prepareTransaction"]>>;
-    try {
-      prepared = await server.prepareTransaction(tx);
-    } catch (err) {
-      // Simulation failed, so nothing was sent and no fee was spent. The usual cause is a message
-      // that was already minted (a retry after success); the raw reason is passed on, not guessed at.
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes(NONCE_ALREADY_USED)) return { status: "delivered" };
+    const prep = await prepareMintTransaction(server, tx, "completeBurn");
+    if (!prep.ok) {
+      if (prep.delivered) return { status: "delivered" };
       return {
         status: "refused",
-        reason: `Stellar would not accept this mint (${msg.slice(0, 200)}). If the USDC has already arrived, it was completed earlier.`,
+        reason: `${prep.reason} If the USDC has already arrived, it was completed earlier.`,
       };
     }
+    const prepared = prep.prepared;
     prepared.sign(keypair);
     const sent = await server.sendTransaction(prepared);
     if (sent.status === "ERROR") throw new Error("the network rejected the transaction");

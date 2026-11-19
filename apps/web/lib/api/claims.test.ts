@@ -178,6 +178,32 @@ describe("buildClaim: Sui to Stellar", () => {
     );
     expect(early.code).toBe("not_ready");
   });
+
+  it("maps a simulation refusal to transaction_rejected (422) and an RPC outage to upstream_unavailable (503)", async () => {
+    const refused = await refusal(
+      svc({
+        suiClaim: async () => ({
+          ok: false,
+          reason: "Stellar would not accept this mint (contract error #7001).",
+        }),
+      }).buildClaim({ chain: "sui", tx: DIGEST, payer: SENDER }),
+    );
+    expect(refused).toMatchObject({
+      code: "transaction_rejected",
+      status: 422,
+      detail: "Stellar would not accept this mint (contract error #7001).",
+    });
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const outage = await refusal(
+      svc({
+        suiClaim: async () => {
+          throw new Error("connect ETIMEDOUT");
+        },
+      }).buildClaim({ chain: "sui", tx: DIGEST, payer: SENDER }),
+    );
+    expect(outage).toMatchObject({ code: "upstream_unavailable", status: 503 });
+  });
 });
 
 describe("transferStatus: Sui", () => {
