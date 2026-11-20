@@ -382,7 +382,6 @@ export async function completeBurn(
           retryAfterMs: RETRY_AFTER_MS,
           reason: "Stellar is busy and declined to queue the mint right now. Try again shortly.",
         };
-      case "ERROR":
       default:
         return {
           status: "failed",
